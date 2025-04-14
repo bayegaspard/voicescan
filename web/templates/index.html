@@ -1,0 +1,609 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VoiceSec - Voice-Controlled Security Scanner</title>
+    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+    <style>
+        .recording {
+            animation: pulse 1.5s infinite;
+        }
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
+        }
+        .voice-wave {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 50px;
+            gap: 2px;
+        }
+        .voice-bar {
+            width: 3px;
+            background-color: #3B82F6;
+            border-radius: 3px;
+            animation: wave 1s ease-in-out infinite;
+        }
+        @keyframes wave {
+            0%, 100% { height: 20%; }
+            50% { height: 100%; }
+        }
+        .processing-dots {
+            display: flex;
+            justify-content: center;
+            gap: 4px;
+        }
+        .processing-dot {
+            width: 8px;
+            height: 8px;
+            background-color: #3B82F6;
+            border-radius: 50%;
+            animation: bounce 1.4s infinite;
+        }
+        @keyframes bounce {
+            0%, 100% { transform: translateY(0); }
+            50% { transform: translateY(-10px); }
+        }
+        .processing-dot:nth-child(1) { animation-delay: 0s; }
+        .processing-dot:nth-child(2) { animation-delay: 0.2s; }
+        .processing-dot:nth-child(3) { animation-delay: 0.4s; }
+        .status-card {
+            transition: all 0.3s ease;
+            transform-origin: top;
+        }
+        .status-card.entering {
+            animation: slideIn 0.5s ease forwards;
+        }
+        @keyframes slideIn {
+            from { transform: translateY(-20px); opacity: 0; }
+            to { transform: translateY(0); opacity: 1; }
+        }
+        .scan-progress {
+            position: relative;
+            height: 4px;
+            background-color: #E5E7EB;
+            border-radius: 2px;
+            overflow: hidden;
+        }
+        .scan-progress-bar {
+            position: absolute;
+            height: 100%;
+            background-color: #3B82F6;
+            animation: progress 2s ease-in-out infinite;
+        }
+        @keyframes progress {
+            0% { width: 0%; }
+            50% { width: 100%; }
+            100% { width: 0%; }
+        }
+        .result-card {
+            transition: all 0.3s ease;
+            transform-origin: top;
+        }
+        .result-card.entering {
+            animation: fadeIn 0.5s ease forwards;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: scale(0.95); }
+            to { opacity: 1; transform: scale(1); }
+        }
+        .ai-response {
+            position: relative;
+            padding-left: 2rem;
+        }
+        .ai-response::before {
+            content: '';
+            position: absolute;
+            left: 0;
+            top: 0;
+            bottom: 0;
+            width: 4px;
+            background: linear-gradient(to bottom, #3B82F6, #60A5FA);
+            border-radius: 2px;
+        }
+        .typing {
+            display: inline-block;
+            overflow: hidden;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            animation: typing 3.5s steps(40, end);
+        }
+        @keyframes typing {
+            from { width: 0 }
+            to { width: 100% }
+        }
+        .severity-critical { background-color: #ef4444; }
+        .severity-high { background-color: #f97316; }
+        .severity-medium { background-color: #eab308; }
+        .severity-low { background-color: #22c55e; }
+        .severity-info { background-color: #3b82f6; }
+        .scan-results {
+            max-height: 60vh;
+            overflow-y: auto;
+        }
+        @media (max-width: 640px) {
+            .scan-results {
+                max-height: 40vh;
+            }
+        }
+        .vulnerability-card {
+            transition: all 0.3s ease;
+        }
+        .vulnerability-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+        }
+        /* Custom scrollbar styles */
+        .scrollbar-thin::-webkit-scrollbar {
+            width: 6px;
+        }
+        .scrollbar-thin::-webkit-scrollbar-track {
+            background: #f1f1f1;
+            border-radius: 3px;
+        }
+        .scrollbar-thin::-webkit-scrollbar-thumb {
+            background: #3b82f6;
+            border-radius: 3px;
+        }
+        .scrollbar-thin::-webkit-scrollbar-thumb:hover {
+            background: #2563eb;
+        }
+        /* Responsive max-height */
+        @media (max-width: 640px) {
+            .max-h-48 {
+                max-height: 32vh;
+            }
+        }
+    </style>
+</head>
+<body class="bg-gray-100">
+    <div class="container mx-auto px-4 py-8">
+        <h1 class="text-3xl font-bold text-center mb-8">VoiceSec</h1>
+        
+        <div class="max-w-2xl mx-auto bg-white rounded-lg shadow-md p-6">
+            <!-- Voice Command Section -->
+            <div class="mb-6">
+                <h2 class="text-xl font-semibold mb-4">Voice Command</h2>
+                <div class="flex items-center justify-center space-x-4">
+                    <button id="recordButton" class="bg-blue-500 hover:bg-blue-600 text-white font-bold py-2 px-4 rounded flex items-center transition-all duration-300">
+                        <svg class="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z"></path>
+                        </svg>
+                        <span id="buttonText">Start Recording</span>
+                    </button>
+                    <div id="voiceWave" class="voice-wave hidden">
+                        <div class="voice-bar"></div>
+                        <div class="voice-bar"></div>
+                        <div class="voice-bar"></div>
+                        <div class="voice-bar"></div>
+                        <div class="voice-bar"></div>
+                    </div>
+                </div>
+                <p id="recordingStatus" class="mt-2 text-sm text-gray-600 text-center">Click the button to start recording</p>
+            </div>
+
+            <!-- Processing Status Section -->
+            <div id="processingStatus" class="mb-6 hidden">
+                <h2 class="text-xl font-semibold mb-4">Processing Status</h2>
+                <div class="p-4 bg-gray-50 rounded-lg">
+                    <div class="scan-progress mb-4">
+                        <div class="scan-progress-bar"></div>
+                    </div>
+                    <div class="processing-dots mb-2">
+                        <div class="processing-dot"></div>
+                        <div class="processing-dot"></div>
+                        <div class="processing-dot"></div>
+                    </div>
+                    <p id="processingMessage" class="text-center text-sm text-gray-600">Processing your command...</p>
+                </div>
+            </div>
+
+            <!-- Command Status Section -->
+            <div class="mb-6">
+                <h2 class="text-xl font-semibold mb-4">Command Status</h2>
+                <div id="commandStatus" class="p-4 bg-gray-100 rounded status-card">
+                    <p class="text-sm text-gray-700">No command processed yet.</p>
+                </div>
+            </div>
+
+            <!-- Text Output Section -->
+            <div class="mb-6">
+                <h2 class="text-xl font-semibold mb-4">Text Output</h2>
+                <div id="textOutput" class="p-4 bg-gray-100 rounded status-card">
+                    <pre class="text-sm text-gray-700">No text output yet.</pre>
+                </div>
+            </div>
+
+            <!-- Scan Progress Section -->
+            <div id="scanProgress" class="hidden mb-6">
+                <div class="flex items-center justify-between mb-2">
+                    <span class="text-sm font-medium text-gray-700">Scan Progress</span>
+                    <span id="progressText" class="text-sm text-gray-500">0%</span>
+                </div>
+                <div class="w-full bg-gray-200 rounded-full h-2.5">
+                    <div id="progressBar" class="bg-blue-600 h-2.5 rounded-full transition-all duration-300" style="width: 0%"></div>
+                </div>
+                <div id="scanStatus" class="mt-2 text-sm text-gray-600"></div>
+            </div>
+
+            <!-- Scan Results Section -->
+            <div id="scanResults" class="mb-6">
+                <h2 class="text-xl font-semibold mb-4">Scan Results</h2>
+                <div class="scan-results space-y-4">
+                    <!-- Results will be dynamically inserted here -->
+                </div>
+            </div>
+
+            <!-- AI Interpretation Section -->
+            <div class="mb-6">
+                <h2 class="text-xl font-semibold mb-4">AI Interpretation</h2>
+                <div id="aiInterpretation" class="bg-white p-4 rounded-lg shadow">
+                    <div class="max-h-48 overflow-y-auto scrollbar-thin scrollbar-thumb-blue-500 scrollbar-track-gray-100">
+                        <pre class="text-sm text-gray-700 whitespace-pre-wrap break-words"></pre>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const recordButton = document.getElementById('recordButton');
+        const buttonText = document.getElementById('buttonText');
+        const recordingStatus = document.getElementById('recordingStatus');
+        const processingStatus = document.getElementById('processingStatus');
+        const processingMessage = document.getElementById('processingMessage');
+        const commandStatus = document.getElementById('commandStatus');
+        const textOutput = document.getElementById('textOutput');
+        const scanResults = document.getElementById('scanResults');
+        const voiceWave = document.getElementById('voiceWave');
+        let socket;
+        let mediaRecorder;
+        let audioChunks = [];
+        let isRecording = false;
+        let audioContext;
+        let audioQueue = [];
+        let isPlaying = false;
+        let currentAudio = null;
+
+        function playNextAudio() {
+            if (audioQueue.length === 0) {
+                isPlaying = false;
+                return;
+            }
+
+            isPlaying = true;
+            const audioBlob = audioQueue.shift();
+            const audioUrl = URL.createObjectURL(audioBlob);
+            
+            // Stop any currently playing audio
+            if (currentAudio) {
+                currentAudio.pause();
+                currentAudio = null;
+            }
+
+            // Create and play new audio
+            currentAudio = new Audio(audioUrl);
+            
+            currentAudio.onended = () => {
+                URL.revokeObjectURL(audioUrl);
+                playNextAudio();
+            };
+
+            currentAudio.onerror = (error) => {
+                console.error("Error playing audio:", error);
+                URL.revokeObjectURL(audioUrl);
+                playNextAudio();
+            };
+
+            currentAudio.play().catch(error => {
+                console.error("Error playing audio:", error);
+                URL.revokeObjectURL(audioUrl);
+                playNextAudio();
+            });
+        }
+
+        async function connectWebSocket() {
+            socket = new WebSocket(`ws://${window.location.host}/ws`);
+            
+            socket.onopen = () => {
+                console.log('WebSocket connected');
+                document.getElementById('status').textContent = 'Connected';
+            };
+            
+            socket.onclose = () => {
+                console.log('WebSocket disconnected');
+                document.getElementById('status').textContent = 'Disconnected';
+                setTimeout(connectWebSocket, 1000);
+            };
+            
+            socket.onmessage = async (event) => {
+                try {
+                    // Check if the message is binary (audio) or JSON
+                    if (event.data instanceof Blob) {
+                        // Add audio to queue
+                        audioQueue.push(event.data);
+                        if (!isPlaying) {
+                            playNextAudio();
+                        }
+                    } else {
+                        // Handle JSON data
+                        const data = JSON.parse(event.data);
+                        console.log("Received JSON data:", data);
+                        
+                        // Update UI
+                        updateUI(data);
+                    }
+                } catch (error) {
+                    console.error('Error processing WebSocket message:', error);
+                    updateStatus('Error processing response');
+                }
+            };
+        }
+
+        // Initialize WebSocket connection
+        connectWebSocket();
+
+        // Function to show status message
+        function showStatus(message, type = 'info') {
+            const statusCard = document.createElement('div');
+            statusCard.className = `p-4 rounded status-card entering ${type === 'error' ? 'bg-red-100' : 'bg-blue-100'}`;
+            statusCard.innerHTML = `<p class="text-sm ${type === 'error' ? 'text-red-700' : 'text-blue-700'}">${message}</p>`;
+            commandStatus.innerHTML = '';
+            commandStatus.appendChild(statusCard);
+        }
+
+        // Function to show processing status
+        function showProcessing(message) {
+            processingStatus.classList.remove('hidden');
+            processingMessage.textContent = message;
+        }
+
+        // Function to hide processing status
+        function hideProcessing() {
+            processingStatus.classList.add('hidden');
+        }
+
+        // Function to show AI response
+        function showAIResponse(text, element) {
+            const response = document.createElement('div');
+            response.className = 'ai-response';
+            const pre = document.createElement('pre');
+            pre.className = 'text-sm text-gray-700 whitespace-pre-wrap break-words typing';
+            pre.textContent = text;
+            response.appendChild(pre);
+            element.querySelector('pre').replaceWith(response);
+        }
+
+        // Function to format scan results
+        function formatScanResults(data) {
+            const resultsDiv = document.getElementById('scanResults');
+            resultsDiv.innerHTML = '';
+            resultsDiv.classList.remove('hidden');
+
+            // Target Information
+            const targetInfo = document.createElement('div');
+            targetInfo.className = 'bg-white p-4 rounded-lg shadow mb-4';
+            targetInfo.innerHTML = `
+                <h3 class="font-semibold text-lg mb-2">Target Information</h3>
+                <p class="text-gray-700">IP: ${data.target}</p>
+                <p class="text-gray-700">Scan Type: ${data.scan_type}</p>
+            `;
+            resultsDiv.appendChild(targetInfo);
+
+            // Open Ports
+            if (data.open_ports && data.open_ports.length > 0) {
+                const portsSection = document.createElement('div');
+                portsSection.className = 'bg-white p-4 rounded-lg shadow mb-4';
+                portsSection.innerHTML = `
+                    <h3 class="font-semibold text-lg mb-2">Open Ports</h3>
+                    <div class="space-y-2">
+                        ${data.open_ports.map(port => `
+                            <div class="border-l-4 border-blue-500 pl-4 py-2">
+                                <p class="font-medium">Port ${port.port}/${port.protocol}</p>
+                                <p class="text-gray-600">Service: ${port.service}</p>
+                                <p class="text-gray-600">Version: ${port.version}</p>
+                            </div>
+                        `).join('')}
+                    </div>
+                `;
+                resultsDiv.appendChild(portsSection);
+            }
+
+            // Vulnerabilities
+            if (data.open_ports && data.open_ports.some(port => port.vulnerabilities && port.vulnerabilities.length > 0)) {
+                const vulnsSection = document.createElement('div');
+                vulnsSection.className = 'bg-white p-4 rounded-lg shadow mb-4';
+                vulnsSection.innerHTML = `
+                    <h3 class="font-semibold text-lg mb-2">Vulnerabilities</h3>
+                    <div class="space-y-4">
+                        ${data.open_ports.map(port => 
+                            port.vulnerabilities && port.vulnerabilities.length > 0 ? `
+                                <div class="mb-4">
+                                    <h4 class="font-medium mb-2">Port ${port.port}</h4>
+                                    <div class="space-y-2">
+                                        ${port.vulnerabilities.map(vuln => {
+                                            const severityClass = getSeverityClass(vuln.severity);
+                                            return `
+                                                <div class="vulnerability-card p-3 rounded-lg ${severityClass} text-white">
+                                                    <p class="font-medium">${vuln.id}</p>
+                                                    <p>Severity: ${vuln.severity.toFixed(1)}</p>
+                                                </div>
+                                            `;
+                                        }).join('')}
+                                    </div>
+                                </div>
+                            ` : ''
+                        ).join('')}
+                    </div>
+                `;
+                resultsDiv.appendChild(vulnsSection);
+            }
+
+            // Security Health
+            const healthSection = document.createElement('div');
+            healthSection.className = 'bg-white p-4 rounded-lg shadow';
+            const healthStatus = data.security_health.status;
+            const healthClass = getHealthClass(healthStatus);
+            healthSection.innerHTML = `
+                <h3 class="font-semibold text-lg mb-2">Security Health</h3>
+                <div class="flex items-center mb-2">
+                    <div class="w-4 h-4 rounded-full ${healthClass} mr-2"></div>
+                    <p class="font-medium">Status: ${healthStatus.toUpperCase()}</p>
+                </div>
+                <div class="space-y-2">
+                    ${data.security_health.recommendations.map(rec => `
+                        <p class="text-gray-700">${rec}</p>
+                    `).join('')}
+                </div>
+            `;
+            resultsDiv.appendChild(healthSection);
+        }
+
+        function getSeverityClass(severity) {
+            if (severity >= 9.0) return 'severity-critical';
+            if (severity >= 7.0) return 'severity-high';
+            if (severity >= 4.0) return 'severity-medium';
+            if (severity >= 0.1) return 'severity-low';
+            return 'severity-info';
+        }
+
+        function getHealthClass(status) {
+            switch (status.toLowerCase()) {
+                case 'critical': return 'bg-red-500';
+                case 'warning': return 'bg-yellow-500';
+                case 'good': return 'bg-green-500';
+                default: return 'bg-gray-500';
+            }
+        }
+
+        // Function to show voice wave animation
+        function showVoiceWave() {
+            voiceWave.classList.remove('hidden');
+            const bars = voiceWave.querySelectorAll('.voice-bar');
+            bars.forEach((bar, index) => {
+                bar.style.animationDelay = `${index * 0.1}s`;
+            });
+        }
+
+        // Function to hide voice wave animation
+        function hideVoiceWave() {
+            voiceWave.classList.add('hidden');
+        }
+
+        // Handle record button click
+        recordButton.addEventListener('click', async () => {
+            if (!isRecording) {
+                try {
+                    // Start recording
+                    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    mediaRecorder = new MediaRecorder(stream);
+                    audioChunks = [];
+                    
+                    mediaRecorder.ondataavailable = (e) => {
+                        if (e.data.size > 0) {
+                            audioChunks.push(e.data);
+                        }
+                    };
+                    
+                    mediaRecorder.onstop = async () => {
+                        const audioBlob = new Blob(audioChunks, { type: "audio/webm" });
+                        
+                        // Send audio data through WebSocket
+                        if (socket.readyState === WebSocket.OPEN) {
+                            socket.send(audioBlob);
+                        } else {
+                            console.error("WebSocket is not open");
+                        }
+                        
+                        // Stop all tracks
+                        stream.getTracks().forEach(track => track.stop());
+                    };
+                    
+                    mediaRecorder.start();
+                    isRecording = true;
+                    recordButton.textContent = "Stop Recording";
+                    recordButton.classList.add("bg-red-500");
+                    showVoiceWave();
+                    
+                } catch (error) {
+                    console.error("Error starting recording:", error);
+                    alert("Error accessing microphone. Please ensure you have granted microphone permissions.");
+                }
+            } else {
+                // Stop recording
+                mediaRecorder.stop();
+                isRecording = false;
+                recordButton.textContent = "Start Recording";
+                recordButton.classList.remove("bg-red-500");
+                hideVoiceWave();
+            }
+        });
+
+        function updateUI(data) {
+            const statusDiv = document.getElementById('commandStatus');
+            const textOutputDiv = document.getElementById('textOutput');
+            const scanResultsDiv = document.getElementById('scanResults');
+            const aiInterpretationDiv = document.getElementById('aiInterpretation');
+            const scanProgressDiv = document.getElementById('scanProgress');
+            const progressBar = document.getElementById('progressBar');
+            const progressText = document.getElementById('progressText');
+            const scanStatus = document.getElementById('scanStatus');
+
+            // Update status
+            if (data.status) {
+                statusDiv.innerHTML = `<p class="text-sm ${getStatusColor(data.status)}">${data.status.toUpperCase()}</p>`;
+            }
+
+            // Update text output
+            if (data.text) {
+                textOutputDiv.querySelector('pre').textContent = data.text;
+            }
+
+            // Show/hide scan progress
+            if (data.status === 'processing') {
+                scanProgressDiv.classList.remove('hidden');
+                if (data.progress) {
+                    const progress = Math.min(100, Math.max(0, data.progress));
+                    progressBar.style.width = `${progress}%`;
+                    progressText.textContent = `${progress}%`;
+                    scanStatus.textContent = data.progress_message || 'Scanning in progress...';
+                }
+            } else if (data.status === 'success' || data.status === 'error') {
+                scanProgressDiv.classList.add('hidden');
+            }
+
+            // Update scan results
+            if (data.results) {
+                formatScanResults(data.results);
+            }
+
+            // Update AI interpretation with better formatting
+            if (data.interpretation) {
+                const pre = aiInterpretationDiv.querySelector('pre');
+                pre.textContent = data.interpretation;
+                pre.classList.add('whitespace-pre-wrap', 'break-words');
+                
+                // Add smooth scroll to bottom
+                const scrollContainer = aiInterpretationDiv.querySelector('.max-h-48');
+                scrollContainer.scrollTop = scrollContainer.scrollHeight;
+            }
+        }
+
+        function getStatusColor(status) {
+            switch (status) {
+                case 'success':
+                    return 'text-green-600';
+                case 'error':
+                    return 'text-red-600';
+                case 'processing':
+                    return 'text-blue-600';
+                default:
+                    return 'text-gray-600';
+            }
+        }
+    </script>
+</body>
+</html>
