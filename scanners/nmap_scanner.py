@@ -1,19 +1,19 @@
 import subprocess
-import xml.etree.ElementTree as ET
-import tempfile
-import os
-import shutil
 import logging
-from typing import Dict, List, Optional, Union
-import uuid
+from typing import Dict, List, Optional, Union, Any
 import re
+import shutil
+import ipaddress
 
 class NmapScanner:
+    """Nmap scanner for network security analysis."""
+    
     def __init__(self):
+        # Define non-privileged scan modes
         self.scan_modes = {
-            "port-scan": " -sV -O -vvv",  # Version detection and OS detection
-            "vulnerability": " -sV --script vuln -vvv",  # Vulnerability scan
-            "service": " -sV -O -A -vvv"  # Aggressive scan
+            "port-scan": "-sT -T4 -vvv --max-retries 2 --min-rate 100",
+            "vulnerability": "-sV -sT -T4 -vvv --max-retries 2 --min-rate 100 --script vuln",
+            "service": "-sV -sT -T4 -vvv --max-retries 2 --min-rate 100"
         }
         
         # Set up logging
@@ -23,198 +23,160 @@ class NmapScanner:
         # Check if nmap is installed
         if not shutil.which('nmap'):
             raise RuntimeError("Nmap is not installed. Please install Nmap to use this scanner.")
-        
-        # Compile regex patterns for validation
-        self.ip_pattern = re.compile(
-            r'^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}'
-            r'(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$'
-        )
-        
-        self.domain_pattern = re.compile(
-            r'^([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$'
-        )
 
-    def scan(self, target: str, scan_type: str = "port-scan") -> Dict[str, Union[str, List, Dict]]:
-        """
-        Run an Nmap scan and return the results.
-        
-        Args:
-            target: The target IP or hostname to scan
-            scan_type: Type of scan to perform (port-scan, vulnerability, service, full-scan)
-            
-        Returns:
-            Dictionary containing scan results
-        """
-        try:
-            # Validate target
-            if not target:
-                raise ValueError("Target is required")
-            
-            # Validate target format
-            if not (self.ip_pattern.match(target) or self.domain_pattern.match(target)):
-                raise ValueError(f"Invalid target format: {target}. Must be a valid IP address or domain name.")
-            
-            # Validate scan type
-            if scan_type not in self.scan_modes:
-                raise ValueError(f"Unsupported scan type: {scan_type}")
-            
-            # Create temporary XML output file
-            unique_id = str(uuid.uuid4())
-            xml_output = os.path.join(tempfile.gettempdir(), f"nmap_{unique_id}.xml")
-            
-            try:
-                # Build Nmap command with proper target handling
-                nmap_cmd = f"nmap {self.scan_modes[scan_type]} -oX {xml_output} {target}"
-                
-                # Run Nmap
-                result = subprocess.run(nmap_cmd, shell=True, check=True, capture_output=True, text=True)
-                
-                # Parse XML output
-                tree = ET.parse(xml_output)
-                root = tree.getroot()
-                
-                # Initialize results
-                results = {
-                    "target": target,
-                    "scan_type": scan_type,
-                    "open_ports": [],
-                    "vulnerabilities": [],
-                    "security_health": {
-                        "status": "unknown",
-                        "recommendations": []
-                    }
-                }
-                
-                # Parse host information
-                host = root.find(".//host")
-                if host is not None:
-                    # Get hostname if available
-                    hostnames = host.findall(".//hostname")
-                    if hostnames:
-                        results["hostname"] = hostnames[0].get("name")
-                    
-                    # Get host status
-                    status = host.find(".//status")
-                    if status is not None and status.get("state") == "up":
-                        # Parse ports
-                        for port in host.findall(".//port"):
-                            port_id = port.get("portid")
-                            state = port.find("state")
-                            service = port.find("service")
-                            
-                            if state is not None and state.get("state") == "open":
-                                port_info = {
-                                    "port": port_id,
-                                    "protocol": port.get("protocol"),
-                                    "service": service.get("name") if service is not None else "unknown",
-                                    "version": service.get("version") if service is not None else "unknown",
-                                    "vulnerabilities": []
-                                }
-                                
-                                # Parse vulnerabilities for this port
-                                if scan_type == "vulnerability":
-                                    script = port.find(".//script[@id='vulners']")
-                                    if script is not None:
-                                        for vuln in script.findall(".//elem"):
-                                            if vuln.get("key") == "id":
-                                                vuln_id = vuln.text
-                                                severity = script.find(f".//elem[@key='cvss']")
-                                                if severity is not None:
-                                                    port_info["vulnerabilities"].append({
-                                                        "id": vuln_id,
-                                                        "severity": float(severity.text),
-                                                        "type": "vulnerability"
-                                                    })
-                                
-                                results["open_ports"].append(port_info)
-                
-                # Analyze security health
-                if results["open_ports"]:
-                    # Check for critical vulnerabilities
-                    critical_vulns = []
-                    for port in results["open_ports"]:
-                        for vuln in port.get("vulnerabilities", []):
-                            if vuln["severity"] >= 7.0:
-                                critical_vulns.append({
-                                    "port": port["port"],
-                                    "vulnerability": vuln["id"],
-                                    "severity": vuln["severity"]
-                                })
-                    
-                    if critical_vulns:
-                        results["security_health"]["status"] = "critical"
-                        results["security_health"]["recommendations"].append(
-                            f"Critical vulnerabilities found: {len(critical_vulns)}. "
-                            "Immediate action required."
-                        )
-                    else:
-                        results["security_health"]["status"] = "warning"
-                        results["security_health"]["recommendations"].append(
-                            "No critical vulnerabilities found, but system should be updated."
-                        )
-                else:
-                    results["security_health"]["status"] = "good"
-                    results["security_health"]["recommendations"].append(
-                        "No open ports found. System appears secure."
-                    )
-                
-                return results
-                
-            finally:
-                # Clean up temporary file
-                try:
-                    if os.path.exists(xml_output):
-                        os.unlink(xml_output)
-                except Exception as e:
-                    print(f"Error cleaning up temporary file: {str(e)}")
-                    
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"Nmap scan failed: {str(e)}")
-        except Exception as e:
-            raise RuntimeError(f"Error running scan: {str(e)}")
-
-    def _parse_xml_output(self, root: ET.Element) -> Dict:
-        """
-        Parse the Nmap XML output and extract relevant information.
-        
-        Args:
-            root (ET.Element): The root element of the XML tree
-            
-        Returns:
-            Dict: Parsed scan results including ports and services
-        """
-        ports = []
-        
-        # Find the host element
-        host = root.find(".//host")
-        if host is None:
-            return {"ports": []}
-        
-        # Get host address
-        address = host.find(".//address")
-        host_address = address.get("addr") if address is not None else "unknown"
-        
-        # Get ports
-        for port in root.findall(".//port"):
-            port_info = {
-                "port": port.get("portid"),
-                "protocol": port.get("protocol"),
-                "state": port.find(".//state").get("state") if port.find(".//state") is not None else "unknown",
-                "service": {}
+    def scan(self, target: str, scan_type: str = "basic") -> Dict[str, Any]:
+        """Run an Nmap scan on the target."""
+        if not self._is_valid_target(target):
+            return {
+                "status": "error",
+                "message": f"Invalid target: {target}",
+                "summary": "Please provide a valid IP address or hostname"
             }
+
+        try:
+            # Build Nmap command based on scan type
+            if scan_type == "port":
+                cmd = f"nmap -p- -T4 {target}"
+            elif scan_type == "service":
+                cmd = f"nmap -sV -T4 {target}"
+            elif scan_type == "vulnerability":
+                cmd = f"nmap -sV --script vuln -T4 {target}"
+            else:  # basic scan
+                cmd = f"nmap -T4 {target}"
+
+            self.logger.info(f"Running Nmap command: {cmd}")
             
-            # Get service information
-            service = port.find(".//service")
-            if service is not None:
-                port_info["service"] = {
-                    "name": service.get("name"),
-                    "product": service.get("product"),
-                    "version": service.get("version")
-                }
+            # Run scan
+            process = subprocess.run(
+                cmd.split(),
+                capture_output=True,
+                text=True,
+                check=True
+            )
             
-            ports.append(port_info)
+            output = process.stdout
+            self.logger.info(f"Nmap output: {output}")
+
+            # Parse results
+            open_ports = []
+            vulnerabilities = []
+            
+            for line in output.splitlines():
+                # Parse open ports
+                port_match = re.search(r'(\d+)/tcp\s+open\s+(\S+)', line)
+                if port_match:
+                    port, service = port_match.groups()
+                    open_ports.append({
+                        "port": int(port),
+                        "service": service
+                    })
+                
+                # Parse vulnerabilities
+                vuln_match = re.search(r'\|\s*(VULNERABLE):\s*(.+)', line)
+                if vuln_match:
+                    _, desc = vuln_match.groups()
+                    vulnerabilities.append(desc.strip())
+
+            return {
+                "status": "success",
+                "target": target,
+                "scan_type": scan_type,
+                "open_ports": open_ports,
+                "vulnerabilities": vulnerabilities,
+                "raw_output": output,
+                "summary": self._generate_summary(open_ports, vulnerabilities)
+            }
+
+        except subprocess.CalledProcessError as e:
+            error_msg = f"Nmap scan failed: {e.stderr}"
+            self.logger.error(error_msg)
+            return {
+                "status": "error",
+                "message": error_msg,
+                "summary": "Scan failed due to an error running Nmap"
+            }
+        except Exception as e:
+            error_msg = f"Unexpected error during scan: {str(e)}"
+            self.logger.error(error_msg)
+            return {
+                "status": "error",
+                "message": error_msg,
+                "summary": "An unexpected error occurred during the scan"
+            }
+
+    def _is_valid_target(self, target: str) -> bool:
+        """Validate if target is a valid IP or hostname."""
+        # Check if it's a valid IP
+        try:
+            ip = ipaddress.ip_address(target)
+            # Don't allow 0.0.0.0 or similar invalid IPs
+            if ip.is_unspecified or ip.is_multicast or ip.is_reserved:
+                return False
+            return True
+        except ValueError:
+            # Check if it's a valid hostname
+            try:
+                return all(
+                    part and all(c.isalnum() or c in '-.' for c in part)
+                    for part in target.split('.')
+                )
+            except Exception:
+                return False
+
+    def _parse_nmap_output(self, output: str) -> Dict:
+        """Parse Nmap output into structured data."""
+        results = {
+            "open_ports": [],
+            "services": [],
+            "vulnerabilities": [],
+            "security_health": {
+                "status": "unknown",
+                "recommendations": []
+            }
+        }
         
-        return {
-            "host": host_address,
-            "ports": ports
-        } 
+        # Parse open ports and services
+        for line in output.split('\n'):
+            if '/open/' in line.lower():
+                port_info = line.split()
+                if len(port_info) >= 3:
+                    port = port_info[0].split('/')[0]
+                    protocol = port_info[0].split('/')[1]
+                    service = port_info[2]
+                    results["open_ports"].append({
+                        "port": port,
+                        "protocol": protocol,
+                        "service": service
+                    })
+                    results["services"].append(service)
+        
+        # Assess security health
+        if not results["open_ports"]:
+            results["security_health"]["status"] = "secure"
+            results["security_health"]["recommendations"].append("No open ports found")
+        else:
+            results["security_health"]["status"] = "needs_attention"
+            results["security_health"]["recommendations"].append(
+                f"Found {len(results['open_ports'])} open ports that should be reviewed"
+            )
+        
+        return results
+    
+    def _generate_summary(self, open_ports: List[Dict], vulnerabilities: List[str]) -> str:
+        """Generate a human-readable summary of scan results."""
+        summary_parts = []
+        
+        if open_ports:
+            port_summary = f"Found {len(open_ports)} open port(s): "
+            port_summary += ", ".join(f"{p['port']}/{p['service']}" for p in open_ports)
+            summary_parts.append(port_summary)
+        else:
+            summary_parts.append("No open ports found")
+            
+        if vulnerabilities:
+            vuln_summary = f"Found {len(vulnerabilities)} vulnerability/ies"
+            summary_parts.append(vuln_summary)
+        else:
+            summary_parts.append("No vulnerabilities detected")
+            
+        return ". ".join(summary_parts) 

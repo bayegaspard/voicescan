@@ -1,104 +1,118 @@
 import re
-from typing import Dict, Any, Optional
+from typing import Dict, Optional
 
 class IntentParser:
     """Parse voice commands into structured intents."""
     
     def __init__(self):
+        # Define patterns for different types of targets
+        self.patterns = {
+            'ipv4': r'\b(?:\d{1,3}\.){3}\d{1,3}\b',
+            'ipv6': r'\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\b',
+            'domain': r'\b(?:https?://)?(?:www\.)?([a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}\b'
+        }
+        
         # Define scan types and their variations
         self.scan_types = {
-            "port-scan": ["port scan", "port scanning", "scan ports", "check ports"],
-            "vulnerability": ["vulnerability scan", "vulnerability scanning", "check vulnerabilities", "scan for vulnerabilities"],
-            "service": ["service scan", "service scanning", "check services", "scan services"]
+            'port-scan': ['port scan', 'port scanning', 'scan ports', 'check ports', 'perform port scan'],
+            'vulnerability': ['vulnerability scan', 'vulnerability scanning', 'scan for vulnerabilities', 
+                            'check vulnerabilities', 'perform vulnerability scan'],
+            'service': ['service scan', 'service scanning', 'scan services', 'check services', 
+                       'perform service scan']
         }
         
-        # Define commands and their variations
-        self.commands = {
-            "scan": ["scan", "perform", "run", "execute", "do", "conduct", "carry out"]
+        # Common domain name variations
+        self.domain_variations = {
+            'microsoft': ['microsoft', 'micro soft', 'micro-soft'],
+            'google': ['google', 'goo gle', 'goo-gle'],
+            'amazon': ['amazon', 'ama zon', 'ama-zon']
         }
-        
-        # Compile regex patterns
-        self.ip_pattern = re.compile(
-            r'^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}'
-            r'(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$'
-        )
-        
-        self.domain_pattern = re.compile(
-            r'^([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$'
-        )
     
-    def parse_intent(self, text: str) -> Dict[str, Any]:
+    def _clean_text(self, text: str) -> str:
+        """Clean and normalize text for better parsing."""
+        # Convert to lowercase
+        text = text.lower()
+        
+        # Remove extra spaces
+        text = ' '.join(text.split())
+        
+        # Fix common domain name variations
+        for correct, variations in self.domain_variations.items():
+            for variation in variations:
+                if variation in text:
+                    text = text.replace(variation, correct)
+        
+        return text
+    
+    def _extract_target(self, text: str) -> Optional[str]:
+        """Extract target from text."""
+        # Clean the text first
+        text = self._clean_text(text)
+        
+        # Try to match IPv4
+        ipv4_match = re.search(self.patterns['ipv4'], text)
+        if ipv4_match:
+            # Validate IPv4
+            ip = ipv4_match.group()
+            if all(0 <= int(octet) <= 255 for octet in ip.split('.')):
+                return ip
+        
+        # Try to match IPv6
+        ipv6_match = re.search(self.patterns['ipv6'], text)
+        if ipv6_match:
+            return ipv6_match.group()
+        
+        # Try to match domain
+        domain_match = re.search(self.patterns['domain'], text)
+        if domain_match:
+            domain = domain_match.group()
+            # Remove http:// or https:// if present
+            domain = re.sub(r'^https?://', '', domain)
+            # Remove www. if present
+            domain = re.sub(r'^www\.', '', domain)
+            return domain
+        
+        return None
+    
+    def _extract_scan_type(self, text: str) -> str:
+        """Extract scan type from text."""
+        text = self._clean_text(text)
+        for scan_type, variations in self.scan_types.items():
+            if any(variation in text for variation in variations):
+                return scan_type
+        return 'port-scan'  # Default to port scan
+    
+    def parse_intent(self, text: str) -> Dict:
         """Parse text into structured intent."""
-        try:
-            text = text.lower().strip()
-            
-            # Initialize result
-            result = {
-                "status": "success",
-                "command": None,
-                "target": None,
-                "scan_type": "port-scan",  # Default scan type
-                "mode": "port-scan"  # Default mode
+        if not text:
+            return {
+                "status": "error",
+                "message": "No text provided"
             }
+        
+        try:
+            # Clean and normalize the text
+            text = self._clean_text(text)
             
-            # Find command
-            command_found = False
-            for cmd, variations in self.commands.items():
-                if any(variation in text for variation in variations):
-                    result["command"] = cmd
-                    command_found = True
-                    break
-            
-            if not command_found:
-                return {
-                    "status": "error",
-                    "message": "No valid command found"
-                }
-            
-            # Find scan type
-            scan_type_found = False
-            for scan_type, variations in self.scan_types.items():
-                if any(variation in text for variation in variations):
-                    result["scan_type"] = scan_type
-                    result["mode"] = scan_type
-                    scan_type_found = True
-                    break
-            
-            # Extract target (IP or domain)
-            target = None
-            
-            # First try to find IP address
-            ip_match = self.ip_pattern.search(text)
-            if ip_match:
-                target = ip_match.group(0)
-            
-            # If no IP found, try to find domain
-            if not target:
-                # Split text into words and look for potential domains
-                words = text.split()
-                for word in words:
-                    # Remove common punctuation
-                    word = word.strip('.,!?')
-                    if self.domain_pattern.match(word):
-                        target = word
-                        break
-            
+            # Extract target
+            target = self._extract_target(text)
             if not target:
                 return {
                     "status": "error",
-                    "message": "No valid target (IP address or domain) found"
+                    "message": "Could not identify target in command"
                 }
             
-            result["target"] = target
+            # Extract scan type
+            scan_type = self._extract_scan_type(text)
             
-            return result
+            return {
+                "status": "success",
+                "target": target,
+                "scan_type": scan_type
+            }
             
         except Exception as e:
             return {
                 "status": "error",
                 "message": f"Error parsing intent: {str(e)}"
-            }
-    
-    def validate_target(self, target: str) -> bool:
-        """Validate if target is a valid IP address or domain name."""
-        return bool(self.ip_pattern.match(target) or self.domain_pattern.match(target)) 
+            } 

@@ -14,10 +14,10 @@ import subprocess
 import torch
 import whisper
 from gtts import gTTS
-import requests
+import aiohttp
 import asyncio
 from scanners.nmap_scanner import NmapScanner
-from nlp.intent_parser import IntentParser
+from intent_parser import IntentParser
 from tts.text_to_speech import TextToSpeech
 import websockets
 import base64
@@ -29,7 +29,8 @@ from pydantic import BaseModel, Field
 from pathlib import Path
 from typing import Optional, Union
 import uuid
-import re
+from pydub import AudioSegment
+import librosa
 
 # Configure logging first
 logging.basicConfig(level=logging.INFO)
@@ -48,11 +49,6 @@ templates = Jinja2Templates(directory="web/templates")
 nmap_scanner = NmapScanner()
 intent_parser = IntentParser()
 
-# Initialize Whisper model
-device = "cuda" if torch.cuda.is_available() else "cpu"
-logger.info(f"Using device: {device}")
-model = whisper.load_model("base", device=device)
-
 # Create temp directory
 temp_dir = tempfile.mkdtemp()
 logger.info(f"Using system temp directory: {temp_dir}")
@@ -62,8 +58,33 @@ else:
     logger.error("Temp directory is not writable")
     raise RuntimeError("Cannot write to temp directory")
 
+# Initialize Whisper model
+device = "cuda" if torch.cuda.is_available() else "cpu"
+logger.info(f"Using device: {device}")
+
+# Create a persistent cache directory for the model
+model_cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "voicesec", "whisper")
+os.makedirs(model_cache_dir, exist_ok=True)
+logger.info(f"Using model cache directory: {model_cache_dir}")
+
+# Load Whisper model with weights_only=True
+try:
+    # Override torch.load to use weights_only=True
+    original_torch_load = torch.load
+    def safe_torch_load(*args, **kwargs):
+        kwargs['weights_only'] = True
+        return original_torch_load(*args, **kwargs)
+    torch.load = safe_torch_load
+
+    # Load model with caching
+    model = whisper.load_model("base", device=device, download_root=model_cache_dir)
+    logger.info("Whisper model loaded successfully")
+except Exception as e:
+    logger.error(f"Error loading Whisper model: {str(e)}")
+    raise
+
 # Initialize components
-stt_model = whisper.load_model("base", device=device)
+stt_model = model  # Use the same model instance
 tts = TextToSpeech()
 
 class CommandResponse(BaseModel):
@@ -137,56 +158,19 @@ def convert_webm_to_wav(webm_path: str) -> str:
         logger.error(f"Error converting WebM to WAV: {e}")
         raise HTTPException(status_code=500, detail="Failed to convert audio format")
 
-async def get_ollama_response(prompt: str, context: str = "") -> str:
-    """Get a dynamic response from Ollama with context."""
-    try:
-        # Add context to make responses more conversational
-        full_prompt = f"""You are a friendly security scanning assistant. 
-        {context}
-        {prompt}
-        Please respond in a conversational, helpful tone. Keep responses concise and clear."""
-        
-        logger.info(f"Sending prompt to Ollama: {full_prompt}")
-        response = requests.post(
-            "http://localhost:11434/api/generate",
-            json={
-                "model": "llama2",
-                "prompt": full_prompt,
-                "stream": False,
-                "options": {
-                    "temperature": 0.7,
-                    "top_p": 0.9,
-                    "max_tokens": 150
-                }
-            }
-        )
-        response.raise_for_status()
-        ollama_response = response.json()["response"].strip()
-        logger.info(f"Received Ollama response: {ollama_response}")
-        return ollama_response
-    except Exception as e:
-        logger.error(f"Error getting Ollama response: {str(e)}")
-        return "I'm having trouble generating a response right now. Let me try that again."
-
-async def generate_voice_response(text: str) -> bytes:
+def generate_voice_response(text: str) -> bytes:
     """Generate voice response using gTTS."""
     try:
-        # Create a temporary file to store the audio
-        temp_file = os.path.join(temp_dir, f"voice_{uuid.uuid4()}.mp3")
+        # Create a BytesIO object to store the audio
+        audio_buffer = io.BytesIO()
         
-        # Generate speech with gTTS
+        # Generate speech with gTTS and write to buffer
         tts = gTTS(text=text, lang='en', slow=False)
-        tts.save(temp_file)
+        tts.write_to_fp(audio_buffer)
         
-        # Read the generated audio file
-        with open(temp_file, "rb") as f:
-            audio_data = f.read()
-        
-        # Clean up the temporary file
-        try:
-            os.unlink(temp_file)
-        except Exception as e:
-            logger.error(f"Error cleaning up temporary file: {str(e)}")
+        # Get the audio data from the buffer
+        audio_buffer.seek(0)
+        audio_data = audio_buffer.read()
         
         return audio_data
     except Exception as e:
@@ -195,6 +179,37 @@ async def generate_voice_response(text: str) -> bytes:
             status_code=500,
             detail=f"Failed to generate voice response: {str(e)}"
         )
+
+async def get_ollama_response(prompt: str) -> str:
+    """Get a response from Ollama."""
+    try:
+        # Create a friendly, conversational prompt
+        full_prompt = f"""You are a friendly security scanning assistant.
+        Please analyze the following information and provide a clear, conversational response:
+        
+        {prompt}
+        
+        Keep your response natural and easy to understand, focusing on the most important findings."""
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "http://localhost:11434/api/generate",
+                json={
+                    "model": "llama2",
+                    "prompt": full_prompt,
+                    "stream": False
+                }
+            ) as response:
+                if response.status == 200:
+                    result = await response.json()
+                    return result["response"].strip()
+                else:
+                    error_msg = await response.text()
+                    logger.error(f"Ollama API error: {error_msg}")
+                    return "I'm having trouble analyzing the results right now. Let me try again."
+    except Exception as e:
+        logger.error(f"Error getting Ollama response: {str(e)}")
+        return "I'm having trouble generating a response right now. Let me try that again."
 
 async def interpret_scan_results(scan_result: dict) -> str:
     """Interpret scan results using Ollama."""
@@ -218,8 +233,7 @@ async def interpret_scan_results(scan_result: dict) -> str:
         
         logger.info("Sending scan results to Ollama for interpretation")
         interpretation = await get_ollama_response(
-            "Analyze these security scan results and provide recommendations.",
-            context
+            "Analyze these security scan results and provide recommendations."
         )
         logger.info(f"Received scan interpretation: {interpretation}")
         return interpretation
@@ -227,181 +241,267 @@ async def interpret_scan_results(scan_result: dict) -> str:
         logger.error(f"Error interpreting scan results: {str(e)}")
         return "I had trouble analyzing the scan results. Let me try again."
 
-async def process_command(audio_data: bytes) -> AsyncGenerator[Dict[str, Any], None]:
-    """Process voice command and yield results with voice response."""
+async def run_scan_with_progress(scanner: NmapScanner, target: str, scan_type: str) -> AsyncGenerator[Dict[str, Any], None]:
+    """Run a scan with progress updates."""
     try:
-        # Convert audio bytes to numpy array
-        import numpy as np
-        from scipy.io import wavfile
-        import io
-        import torch
-        
-        # Create a temporary WAV file in memory
-        audio_file = io.BytesIO(audio_data)
-        
-        # Read the audio data
-        try:
-            sample_rate, audio_array = wavfile.read(audio_file)
-        except ValueError:
-            # If not WAV, try to convert from WebM
-            import subprocess
-            import tempfile
-            
-            # Generate unique filenames
-            unique_id = str(uuid.uuid4())
-            webm_path = os.path.join(temp_dir, f"audio_{unique_id}.webm")
-            wav_path = os.path.join(temp_dir, f"audio_{unique_id}.wav")
-            
-            try:
-                # Write WebM file
-                with open(webm_path, "wb") as webm_file:
-                    webm_file.write(audio_data)
-                
-                # Convert WebM to WAV using ffmpeg
-                subprocess.run([
-                    'ffmpeg', '-y',  # Add -y to force overwrite
-                    '-i', webm_path,
-                    '-acodec', 'pcm_s16le',
-                    '-ar', '16000',
-                    '-ac', '1',
-                    wav_path
-                ], check=True)
-                
-                # Read the converted WAV file
-                sample_rate, audio_array = wavfile.read(wav_path)
-                
-            finally:
-                # Clean up temporary files
-                try:
-                    if os.path.exists(webm_path):
-                        os.unlink(webm_path)
-                    if os.path.exists(wav_path):
-                        os.unlink(wav_path)
-                except Exception as e:
-                    logger.error(f"Error cleaning up temporary files: {str(e)}")
-        
-        # Convert audio array to float32 and normalize
-        audio_array = audio_array.astype(np.float32) / 32768.0  # Convert to float32 and normalize
-        
-        # Convert to torch tensor
-        audio_tensor = torch.from_numpy(audio_array)
-        
-        # Transcribe audio
-        result = stt_model.transcribe(audio_tensor)
-        text = result["text"].strip() if result and "text" in result else None
-        
-        if not text:
-            yield {
-                "status": "error",
-                "message": "Could not transcribe audio",
-                "voice_response": await generate_voice_response("I'm sorry, I couldn't understand your command. Please try again.")
-            }
-            return
-
-        # Parse intent
-        intent = intent_parser.parse_intent(text)
-        if not intent or intent.get("status") != "success":
-            yield {
-                "status": "error",
-                "message": "Could not understand command",
-                "voice_response": await generate_voice_response("I'm sorry, I couldn't understand what you want me to do. Please try again.")
-            }
-            return
-
-        # Extract command details
-        command = intent.get("command", "")
-        target = intent.get("target", "")
-        scan_type = intent.get("scan_type", "port-scan")
-        mode = intent.get("mode", "port-scan")
-
-        # Validate scan type
-        valid_scan_types = ["port-scan", "vulnerability", "service"]
-        if scan_type not in valid_scan_types:
-            yield {
-                "status": "error",
-                "message": f"Unsupported scan type: {scan_type}. Please use one of: {', '.join(valid_scan_types)}",
-                "voice_response": await generate_voice_response(
-                    f"I'm sorry, I don't support {scan_type} scans. "
-                    f"I can perform port scans, vulnerability scans, or service scans. "
-                    "Please try again with one of these scan types."
-                )
-            }
-            return
-
-        # Generate initial voice response
-        initial_response = await generate_voice_response(f"I'll help you {command}.")
-
-        # Send initial response
+        # Initial progress
         yield {
-            "status": "processing",
-            "text": text,
-            "initial_response": initial_response,
-            "progress": 0,
-            "progress_message": "Initializing scan..."
+            "status": "progress",
+            "percent": 0,
+            "message": f"Initializing {scan_type} scan on {target}..."
+        }
+        await asyncio.sleep(1)
+
+        # Validate target
+        if not scanner._is_valid_target(target):
+            yield {
+                "status": "error",
+                "percent": 100,
+                "message": f"Invalid target: {target}",
+                "summary": "Please provide a valid IP address or hostname"
+            }
+            return
+
+        # Run scan in thread pool
+        loop = asyncio.get_event_loop()
+        
+        # Start the actual scan in a separate task
+        scan_task = loop.run_in_executor(None, scanner.scan, target, scan_type)
+        
+        # Progress updates based on scan type
+        progress_steps = {
+            "port": [
+                (20, "Initiating port discovery..."),
+                (40, "Scanning TCP ports..."),
+                (60, "Analyzing open ports..."),
+                (80, "Finalizing port scan results..."),
+            ],
+            "service": [
+                (20, "Starting service detection..."),
+                (40, "Probing open ports..."),
+                (60, "Identifying services..."),
+                (80, "Analyzing service versions..."),
+            ],
+            "vulnerability": [
+                (20, "Starting vulnerability scan..."),
+                (40, "Running vulnerability scripts..."),
+                (60, "Analyzing potential vulnerabilities..."),
+                (80, "Assessing security risks..."),
+            ],
+            "basic": [
+                (20, "Starting basic scan..."),
+                (40, "Probing target..."),
+                (60, "Gathering basic information..."),
+                (80, "Analyzing results..."),
+            ]
         }
 
-        # Process scan command
-        if "scan" in command.lower():
-            # Run scan with progress updates
-            async for progress_update in run_scan_with_progress(target, scan_type):
-                yield progress_update
-
-            # Get scan results
-            scanner = NmapScanner()
-            try:
-                scan_results = scanner.scan(target, scan_type)
-            except Exception as e:
-                error_message = f"Scan failed: {str(e)}"
-                yield {
-                    "status": "error",
-                    "message": error_message,
-                    "voice_response": await generate_voice_response(
-                        f"I'm sorry, the {scan_type} scan failed. {str(e)} "
-                        "Please try again with a different scan type or target."
-                    )
-                }
-                return
-            
-            # Get AI interpretation
-            interpretation = await get_ollama_response(
-                f"You are a friendly security scanning assistant. "
-                f"I have completed a {scan_type} scan on {target} with the following results:\n"
-                f"Open ports: {len(scan_results.get('open_ports', []))}\n"
-                f"Vulnerabilities found: {len(scan_results.get('vulnerabilities', []))}\n"
-                f"Security health status: {scan_results.get('security_health', {}).get('status', 'unknown')}\n\n"
-                f"Please provide a brief, clear interpretation of these findings."
-            )
-
-            # Generate final voice response
-            final_response = await generate_voice_response(interpretation)
-
-            # Send final results
+        # Send progress updates while scan is running
+        steps = progress_steps.get(scan_type, progress_steps["basic"])
+        for percent, message in steps:
+            # Check if scan is complete
+            if scan_task.done():
+                break
+                
             yield {
-                "status": "success",
-                "text": text,
-                "results": scan_results,
-                "interpretation": interpretation,
-                "voice_response": final_response
+                "status": "progress",
+                "percent": percent,
+                "message": message
             }
+            await asyncio.sleep(2)  # Longer delay between updates
 
-        else:
+        # Get scan results
+        result = await scan_task
+        logger.info(f"Scan completed with result: {result}")
+
+        if result["status"] == "error":
             yield {
                 "status": "error",
-                "message": "Unsupported command",
-                "voice_response": await generate_voice_response("I'm sorry, I don't support that command yet.")
+                "percent": 100,
+                "message": result["message"],
+                "summary": result.get("summary", "Scan failed")
             }
+            return
+
+        # Final success result with detailed information
+        final_result = {
+            "status": "success",
+            "percent": 100,
+            "message": "Scan completed successfully",
+            "target": target,
+            "scan_type": scan_type,
+            "open_ports": result["open_ports"],
+            "vulnerabilities": result["vulnerabilities"],
+            "raw_output": result["raw_output"],
+            "summary": result["summary"],
+            "security_health": {
+                "status": "healthy" if not result["vulnerabilities"] else "at_risk",
+                "open_ports_count": len(result["open_ports"]),
+                "vulnerabilities_count": len(result["vulnerabilities"])
+            }
+        }
+        
+        logger.info(f"Sending final result: {final_result}")
+        yield final_result
 
     except Exception as e:
-        logger.error(f"Error processing command: {str(e)}")
+        logger.error(f"Error during scan: {str(e)}")
         yield {
             "status": "error",
-            "message": str(e),
-            "voice_response": await generate_voice_response("I'm sorry, something went wrong. Please try again.")
+            "percent": 100,
+            "message": f"Unexpected error: {str(e)}",
+            "summary": "An unexpected error occurred during the scan"
+        }
+
+async def process_command(websocket, audio_data: bytes) -> Dict[str, Any]:
+    """Process an audio command and return the response."""
+    try:
+        # Convert audio and transcribe
+        temp_webm = f"/tmp/{uuid.uuid4()}.webm"
+        temp_wav = f"/tmp/{uuid.uuid4()}.wav"
+        
+        try:
+            # Save WebM audio
+            with open(temp_webm, 'wb') as f:
+                f.write(audio_data)
+            
+            # Convert to WAV using ffmpeg
+            subprocess.run(['ffmpeg', '-y', '-i', temp_webm, temp_wav], 
+                         stdout=subprocess.PIPE, 
+                         stderr=subprocess.PIPE)
+            
+            # Load and process audio
+            audio_array, _ = librosa.load(temp_wav, sr=16000)
+            audio_tensor = torch.FloatTensor(audio_array)
+            
+            # Transcribe
+            result = stt_model.transcribe(audio_tensor)
+            command = result["text"].strip()
+            logger.info(f"Transcribed command: {command}")
+            
+        finally:
+            # Cleanup temp files
+            for temp_file in [temp_webm, temp_wav]:
+                try:
+                    if os.path.exists(temp_file):
+                        os.remove(temp_file)
+                except Exception as e:
+                    logger.error(f"Error cleaning up {temp_file}: {e}")
+
+        # Parse intent
+        intent = intent_parser.parse_intent(command)
+        logger.info(f"Parsed intent: {intent}")
+        
+        if intent["status"] == "error":
+            error_response = generate_voice_response(
+                "I'm sorry, I couldn't understand that command. Could you please try again?"
+            )
+            return {
+                "status": "error",
+                "message": intent["message"],
+                "voice_response": error_response
+            }
+
+        target = intent["target"]
+        scan_type = intent["scan_type"]
+        
+        # Create scanner instance
+        nmap_scanner = NmapScanner()
+        
+        # Initial voice response with friendly message
+        initial_response = generate_voice_response(
+            f"I'll help you perform a {scan_type} scan on {target}. This may take a few moments while I analyze the system."
+        )
+        
+        # Send initial response immediately
+        await websocket.send_json({
+            "type": "audio",
+            "data": base64.b64encode(initial_response).decode('utf-8'),
+            "response_type": "initial"
+        })
+        
+        # Run scan with progress
+        scan_result = None
+        async for update in run_scan_with_progress(nmap_scanner, target, scan_type):
+            # Send progress update through websocket
+            await websocket.send_json(update)
+            logger.info(f"Sent progress update: {update}")
+            
+            # Store final result
+            if update["status"] in ["success", "error"]:
+                scan_result = update
+                logger.info(f"Scan completed with result: {scan_result}")
+
+        if not scan_result or scan_result["status"] == "error":
+            error_msg = scan_result.get("message", "Unknown error occurred") if scan_result else "Scan failed"
+            error_response = generate_voice_response(
+                f"I encountered an error while scanning {target}. {error_msg}"
+            )
+            return {
+                "status": "error",
+                "message": error_msg,
+                "voice_response": error_response
+            }
+
+        # Get Ollama interpretation of results
+        interpretation_prompt = f"""
+        Analyze these network scan results and provide a clear, concise security assessment:
+        Target: {target}
+        Scan Type: {scan_type}
+        Open Ports: {scan_result['open_ports']}
+        Vulnerabilities: {scan_result['vulnerabilities']}
+        Raw Output: {scan_result['raw_output']}
+        
+        Focus on:
+        1. Security implications of open ports
+        2. Severity of vulnerabilities
+        3. Recommended actions
+        4. Overall security posture
+        
+        Provide a natural, conversational response suitable for voice output.
+        """
+        
+        # Get AI interpretation
+        interpretation = await get_ollama_response(interpretation_prompt)
+        logger.info(f"Generated interpretation: {interpretation}")
+        
+        # Generate final voice response
+        voice_response = generate_voice_response(interpretation)
+
+        # Return complete result with all necessary information
+        final_result = {
+            "status": "success",
+            "message": "Scan completed successfully",
+            "voice_response": voice_response,
+            "target": target,
+            "scan_type": scan_type,
+            "open_ports": scan_result["open_ports"],
+            "vulnerabilities": scan_result["vulnerabilities"],
+            "raw_output": scan_result["raw_output"],
+            "interpretation": interpretation,
+            "security_health": scan_result.get("security_health", {
+                "status": "unknown",
+                "open_ports_count": 0,
+                "vulnerabilities_count": 0
+            })
+        }
+        
+        logger.info(f"Sending final result: {final_result}")
+        return final_result
+
+    except Exception as e:
+        logger.error(f"Error processing command: {e}")
+        error_response = generate_voice_response(
+            "I'm sorry, but I encountered an error while processing your command. Please try again."
+        )
+        return {
+            "status": "error",
+            "message": f"Error processing command: {str(e)}",
+            "voice_response": error_response
         }
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    """WebSocket endpoint for real-time communication."""
     await websocket.accept()
     print("WebSocket connection established")
     
@@ -411,148 +511,52 @@ async def websocket_endpoint(websocket: WebSocket):
             data = await websocket.receive_bytes()
             print("Received audio data")
             
-            # Process command and stream results
-            async for result in process_command(data):
-                # Send JSON response first
+            # Process the command and send responses
+            result = await process_command(websocket, data)
+            
+            try:
+                # Send initial voice response if available
+                if "initial_response" in result and result["initial_response"]:
+                    print("Sending initial voice response")
+                    await websocket.send_json({
+                        "type": "audio",
+                        "data": base64.b64encode(result["initial_response"]).decode('utf-8'),
+                        "response_type": "initial"
+                    })
+                    await asyncio.sleep(2)  # Wait for initial response to play
+                
+                # Send JSON response with scan results
                 json_response = {
                     "status": result.get("status"),
-                    "text": result.get("text"),
-                    "results": result.get("results"),
                     "message": result.get("message"),
+                    "target": result.get("target"),
+                    "scan_type": result.get("scan_type"),
+                    "open_ports": result.get("open_ports"),
+                    "vulnerabilities": result.get("vulnerabilities"),
+                    "raw_output": result.get("raw_output"),
                     "interpretation": result.get("interpretation"),
-                    "progress": result.get("progress", 0),
-                    "progress_message": result.get("progress_message", "")
+                    "security_health": result.get("security_health")
                 }
                 await websocket.send_json(json_response)
                 
-                # Send voice responses in sequence
-                if result.get("initial_response"):
-                    await websocket.send_bytes(result["initial_response"])
-                    await asyncio.sleep(2)  # Wait for audio to play
-                
-                if result.get("confirmation_response"):
-                    await websocket.send_bytes(result["confirmation_response"])
-                    await asyncio.sleep(2)
-                
-                if result.get("voice_response"):
-                    await websocket.send_bytes(result["voice_response"])
-                    await asyncio.sleep(2)
-    
+                # Send final voice response if available
+                if "voice_response" in result and result["voice_response"]:
+                    print("Sending final voice response")
+                    await websocket.send_json({
+                        "type": "audio",
+                        "data": base64.b64encode(result["voice_response"]).decode('utf-8'),
+                        "response_type": "final"
+                    })
+                    
+            except Exception as e:
+                print(f"Error sending response: {str(e)}")
+                continue
+                    
     except WebSocketDisconnect:
         print("WebSocket connection closed")
     except Exception as e:
         print(f"WebSocket error: {str(e)}")
         await websocket.close()
-
-async def run_scan_with_progress(target: str, scan_type: str) -> AsyncGenerator[Dict[str, Any], None]:
-    """Run Nmap scan with progress updates."""
-    try:
-        scanner = NmapScanner()
-        
-        # Create temporary XML output file
-        import tempfile
-        import os
-        import uuid
-        import subprocess
-        import time
-        
-        unique_id = str(uuid.uuid4())
-        xml_output = os.path.join(tempfile.gettempdir(), f"nmap_{unique_id}.xml")
-        
-        try:
-            # Build Nmap command
-            nmap_cmd = f"nmap {scanner.scan_modes[scan_type]} -oX {xml_output} {target}"
-            print(f"\nStarting Nmap scan with command: {nmap_cmd}\n")
-            
-            # Start Nmap process
-            process = subprocess.Popen(
-                nmap_cmd,
-                shell=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
-            )
-            
-            start_time = time.time()
-            ports_found = 0
-            services_identified = 0
-            
-            # Monitor process output
-            while True:
-                output = process.stdout.readline()
-                if output == '' and process.poll() is not None:
-                    break
-                
-                if output:
-                    # Print Nmap output to terminal
-                    print(output.strip())
-                    
-                    # Parse progress information
-                    if "Discovered open port" in output:
-                        # Extract port number from the output
-                        port_match = re.search(r'port (\d+)/', output)
-                        if port_match:
-                            port = port_match.group(1)
-                            ports_found += 1
-                            progress = min(50 + (ports_found * 5), 90)  # Cap at 90%
-                            yield {
-                                "status": "processing",
-                                "progress": progress,
-                                "progress_message": f"Found {ports_found} open ports...",
-                                "voice_response": await generate_voice_response(
-                                    f"Found port {port} open."
-                                )
-                            }
-                    elif "Service detection performed" in output:
-                        # Extract port and service information
-                        service_match = re.search(r'port (\d+)/.*?(\w+)', output)
-                        if service_match:
-                            port = service_match.group(1)
-                            service = service_match.group(2)
-                            services_identified += 1
-                            yield {
-                                "status": "processing",
-                                "progress": 95,
-                                "progress_message": f"Identified service on port {port}...",
-                                "voice_response": await generate_voice_response(
-                                    f"Identified {service} service on port {port}."
-                                )
-                            }
-            
-            # Get final results
-            scan_results = scanner.scan(target, scan_type)
-            scan_duration = time.time() - start_time
-            
-            # Generate summary voice response
-            summary = (
-                f"Scan completed in {int(scan_duration)} seconds. "
-                f"Found {len(scan_results.get('open_ports', []))} open ports. "
-                f"Identified {sum(1 for port in scan_results.get('open_ports', []) if port.get('service') != 'unknown')} services. "
-                f"Security status: {scan_results.get('security_health', {}).get('status', 'unknown')}."
-            )
-            
-            yield {
-                "status": "success",
-                "results": scan_results,
-                "progress": 100,
-                "progress_message": "Scan completed",
-                "voice_response": await generate_voice_response(summary)
-            }
-            
-        finally:
-            # Clean up temporary file
-            try:
-                if os.path.exists(xml_output):
-                    os.unlink(xml_output)
-            except Exception as e:
-                print(f"Error cleaning up temporary file: {str(e)}")
-                
-    except Exception as e:
-        yield {
-            "status": "error",
-            "message": str(e),
-            "voice_response": await generate_voice_response(f"Scan failed: {str(e)}")
-        }
 
 @app.post("/api/process-voice")
 async def process_voice(file: UploadFile = File(...)):
@@ -561,36 +565,37 @@ async def process_voice(file: UploadFile = File(...)):
         audio_data = await file.read()
         
         # Process the command
-        async for result in process_command(audio_data):
-            # Generate voice responses
-            if result.status == "success":
-                # Generate initial greeting
-                initial_text = "Hello! I'm your security scanning assistant. How can I help you today?"
-                result.initial_response = await generate_voice_response(initial_text)
-                
-                # Generate confirmation
-                confirmation_text = f"I'll help you perform a {result.scan_type} scan on {result.target}."
-                result.confirmation_response = await generate_voice_response(confirmation_text)
-                
-                # Generate results summary
-                open_ports = len(result.open_ports or [])
-                vulnerabilities = len(result.vulnerabilities or [])
-                health_status = result.security_health.get('status', 'unknown') if result.security_health else 'unknown'
-                
-                results_text = (
-                    f"I found {open_ports} open ports and {vulnerabilities} potential vulnerabilities. "
-                    f"The security health status is {health_status}. "
-                    "Would you like me to explain any of these findings in more detail?"
-                )
-                result.voice_response = await generate_voice_response(results_text)
-                
-            elif result.status == "error":
-                # Generate error message
-                error_text = f"I encountered an error: {result.message}. Please try again."
-                result.voice_response = await generate_voice_response(error_text)
-            
-            return result
+        result = await process_command(None, audio_data)
         
+        # Generate voice responses
+        if result.status == "success":
+            # Generate initial greeting
+            initial_text = "Hello! I'm your security scanning assistant. How can I help you today?"
+            result.initial_response = await generate_voice_response(initial_text)
+            
+            # Generate confirmation
+            confirmation_text = f"I'll help you perform a {result.scan_type} scan on {result.target}."
+            result.confirmation_response = await generate_voice_response(confirmation_text)
+            
+            # Generate results summary
+            open_ports = len(result.open_ports or [])
+            vulnerabilities = len(result.vulnerabilities or [])
+            health_status = result.security_health.get('status', 'unknown') if result.security_health else 'unknown'
+            
+            results_text = (
+                f"I found {open_ports} open ports and {vulnerabilities} potential vulnerabilities. "
+                f"The security health status is {health_status}. "
+                "Would you like me to explain any of these findings in more detail?"
+            )
+            result.voice_response = await generate_voice_response(results_text)
+            
+        elif result.status == "error":
+            # Generate error message
+            error_text = f"I encountered an error: {result.message}. Please try again."
+            result.voice_response = await generate_voice_response(error_text)
+        
+        return result
+    
     except Exception as e:
         logger.error(f"Error processing voice command: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -613,5 +618,6 @@ async def play_voice(filename: str):
         logger.error(f"Error playing voice file: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
+# Disable uvicorn reload for production
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True) 
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False) 
